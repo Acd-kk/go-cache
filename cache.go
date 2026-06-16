@@ -15,6 +15,7 @@ func (c *cache) add(key string, value ByteView) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.lru == nil {
+		// 第一次写入时再初始化 LRU
 		c.lru = lru.New(c.cacheBytes, nil)
 	}
 	c.lru.Add(key, value)

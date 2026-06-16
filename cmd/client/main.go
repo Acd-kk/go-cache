@@ -36,6 +36,7 @@ func main() {
 	)
 
 	client := &http.Client{Timeout: *timeout}
+	// 客户端直接请求某个缓存节点
 	res, err := client.Get(u)
 	if err != nil {
 		log.Fatal(err)
@@ -56,6 +57,7 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// 服务端返回的是 protobuf 二进制 这里再解码成真实值
 	fmt.Println(string(out.GetValue()))
 }
 

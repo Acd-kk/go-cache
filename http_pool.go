@@ -24,11 +24,14 @@ const (
 )
 
 type HTTPPool struct {
+	// self 表示当前节点地址
 	self        string
 	basePath    string
 	engine      *gin.Engine
 	mu          sync.RWMutex
+	// peers 是一致性哈希环
 	peers       *consistenthash.Map
+	// httpGetters 保存每个远程节点对应的访问器
 	httpGetters map[string]*httpGetter
 }
 
@@ -50,8 +53,10 @@ func (p *HTTPPool) initRoutes() {
 	p.engine = gin.New()
 	p.engine.Use(gin.Recovery())
 
+	// 这些接口方便查看服务状态和统计信息
 	p.engine.GET("/healthz", p.handleHealthz)
 	p.engine.GET("/stats", p.handleStats)
+	// 这是节点之间获取缓存数据的核心接口
 	p.engine.GET(p.basePath+":groupname/*key", p.handleGet)
 }
 
@@ -75,6 +80,7 @@ func (p *HTTPPool) handleGet(c *gin.Context) {
 		return
 	}
 
+	// 请求进入后 最终都会走到 group 的缓存读取流程
 	view, err := group.Get(key)
 	if err != nil {
 		if errors.Is(err, ErrKeyNotFound) {
@@ -122,6 +128,7 @@ type httpGetter struct {
 }
 
 func (h *httpGetter) Get(in *pb.Request, out *pb.Response) error {
+	// group 和 key 会拼成远程节点的访问路径
 	u := fmt.Sprintf(
 		"%v%v/%v",
 		h.baseURL,
@@ -147,6 +154,7 @@ func (h *httpGetter) Get(in *pb.Request, out *pb.Response) error {
 		return fmt.Errorf("decoding response body: %v", err)
 	}
 
+	// 这里完成 protobuf 二进制到结构体的反序列化
 	return nil
 }
 
@@ -156,6 +164,7 @@ func (p *HTTPPool) Set(peers ...string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// 先统一节点地址格式 避免哈希环和映射不一致
 	normalizedPeers := make([]string, 0, len(peers))
 	for _, peer := range peers {
 		normalizedPeer := normalizePeerURL(peer)
@@ -166,6 +175,7 @@ func (p *HTTPPool) Set(peers ...string) {
 	p.peers.Add(normalizedPeers...)
 	p.httpGetters = make(map[string]*httpGetter, len(normalizedPeers))
 	for _, peer := range normalizedPeers {
+		// 每个远程节点都配一个带超时的 HTTP 客户端
 		p.httpGetters[peer] = &httpGetter{
 			baseURL: peer + p.basePath,
 			client:  &http.Client{Timeout: defaultHTTPTimeout},
@@ -180,6 +190,7 @@ func (p *HTTPPool) PickPeer(key string) (PeerGetter, bool) {
 	if p.peers == nil {
 		return nil, false
 	}
+	// 一致性哈希会根据 key 选择目标节点
 	if peer := p.peers.Get(key); peer != "" && peer != p.self {
 		p.Log("Pick peer %s", peer)
 		return p.httpGetters[peer], true

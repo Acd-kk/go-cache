@@ -22,6 +22,7 @@ func main() {
 
 	group := go_cache.NewGroup("scores", 2<<10, go_cache.GetterFunc(
 		func(key string) ([]byte, error) {
+			// 这里用 map 模拟慢速数据源
 			log.Println("[SlowDB] search key", key)
 			if v, ok := db[key]; ok {
 				return []byte(v), nil
@@ -34,6 +35,7 @@ func main() {
 	if len(peerAddrs) == 0 {
 		log.Fatal("at least one peer is required")
 	}
+	// 把集群中的所有节点注册到当前服务
 	peers.Set(peerAddrs...)
 	group.RegisterPeers(peers)
 
