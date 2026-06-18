@@ -9,6 +9,7 @@
 - `HTTP + protobuf` 节点间通信
 - 独立的服务端和客户端入口
 - 基础健康检查与统计接口
+- 动态新增和删除 key
 
 项目现在的通信方式是：
 
@@ -133,6 +134,8 @@ var db = map[string]string{
 - 你查的是 key，不是 value
 - 比如想拿到 `567`，应该请求 key=`123`
 
+现在服务端的数据源已经支持动态写入和删除
+
 ## 如何启动
 
 ### 环境要求
@@ -215,6 +218,94 @@ go run ./cmd/client -server localhost:8001 -group scores -key 123
 ```text
 567
 ```
+
+## 如何动态新增和删除 key
+
+### 新增 key-value
+
+接口：
+
+```text
+POST /api/cache
+```
+
+请求体示例：
+
+```json
+{
+  "group": "scores",
+  "key": "tom",
+  "value": "999"
+}
+```
+
+命令示例：
+
+```bash
+curl -X POST http://localhost:8001/api/cache \
+  -H "Content-Type: application/json" \
+  -d "{\"group\":\"scores\",\"key\":\"tom\",\"value\":\"999\"}"
+```
+
+返回示例：
+
+```json
+{
+  "group": "scores",
+  "key": "tom",
+  "message": "ok",
+  "value": "999"
+}
+```
+
+新增后可以直接查询：
+
+```bash
+go run ./cmd/client -server localhost:8001 -group scores -key tom
+```
+
+输出：
+
+```text
+999
+```
+
+### 删除 key
+
+接口：
+
+```text
+DELETE /api/cache/{group}/{key}
+```
+
+命令示例：
+
+```bash
+curl -X DELETE http://localhost:8001/api/cache/scores/tom
+```
+
+返回示例：
+
+```json
+{
+  "group": "scores",
+  "key": "tom",
+  "message": "ok"
+}
+```
+
+删除后再次查询会返回找不到：
+
+```bash
+go run ./cmd/client -server localhost:8001 -group scores -key tom
+```
+
+### 这两个接口在多节点下的行为
+
+- 你可以把请求发到任意一个节点
+- 服务端会根据一致性哈希判断这个 key 应该归哪个节点负责
+- 如果目标节点不是当前节点 会自动转发到正确节点
+- 所以新增和删除并不是只在当前端口生效
 
 ## 健康检查和统计接口
 
@@ -325,6 +416,12 @@ go run ./cmd/client -server localhost:8001 -group scores -key 123
 
 所以现在是 `HTTP + protobuf`，不是完整的 `gRPC + protobuf`。
 
+### 4. 新增和删除为什么可以发给任意节点
+
+因为服务端收到写请求后，也会根据一致性哈希判断 key 属于哪个节点。
+
+如果目标节点不是当前节点，就会把写入或删除请求转发过去。
+
 ## 已做的优化
 
 当前版本已经补过这些优化：
@@ -333,6 +430,7 @@ go run ./cmd/client -server localhost:8001 -group scores -key 123
 - HTTP 请求增加超时控制
 - `ErrKeyNotFound` 单独分类，避免把业务错误误报成 500
 - 增加 `/healthz` 和 `/stats`
+- 增加动态写入和删除接口
 - 增加基础测试
 - 使用 `RWMutex` 优化读多写少场景
 - 防止重复创建同名 group
@@ -351,4 +449,4 @@ go test ./...
 - 增加一键启动 3 个节点的脚本
 - 补更多集成测试
 - 将当前 `HTTP + protobuf` 升级为真正的 `gRPC + protobuf`
-- 将模拟 `db` 替换为真实数据源
+- 将当前内存数据源替换为真实数据源

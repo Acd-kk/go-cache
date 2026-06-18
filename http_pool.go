@@ -1,6 +1,8 @@
 package go_cache
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go-cache/consistenthash"
@@ -25,14 +27,20 @@ const (
 
 type HTTPPool struct {
 	// self 表示当前节点地址
-	self        string
-	basePath    string
-	engine      *gin.Engine
-	mu          sync.RWMutex
+	self     string
+	basePath string
+	engine   *gin.Engine
+	mu       sync.RWMutex
 	// peers 是一致性哈希环
-	peers       *consistenthash.Map
+	peers *consistenthash.Map
 	// httpGetters 保存每个远程节点对应的访问器
 	httpGetters map[string]*httpGetter
+}
+
+type cacheWriteRequest struct {
+	Group string `json:"group"`
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
 func NewHTTPPool(self string) *HTTPPool {
@@ -56,6 +64,9 @@ func (p *HTTPPool) initRoutes() {
 	// 这些接口方便查看服务状态和统计信息
 	p.engine.GET("/healthz", p.handleHealthz)
 	p.engine.GET("/stats", p.handleStats)
+	// 这两个接口用于动态写入和删除 key
+	p.engine.POST("/api/cache", p.handleSet)
+	p.engine.DELETE("/api/cache/:group/*key", p.handleDelete)
 	// 这是节点之间获取缓存数据的核心接口
 	p.engine.GET(p.basePath+":groupname/*key", p.handleGet)
 }
@@ -114,6 +125,78 @@ func (p *HTTPPool) handleStats(c *gin.Context) {
 	})
 }
 
+func (p *HTTPPool) handleSet(c *gin.Context) {
+	var req cacheWriteRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Group == "" || req.Key == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "group and key are required"})
+		return
+	}
+
+	group := GetGroup(req.Group)
+	if group == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no such group: " + req.Group})
+		return
+	}
+
+	if err := group.Set(req.Key, []byte(req.Value)); err != nil {
+		if errors.Is(err, ErrKeyNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "ok",
+		"group":   req.Group,
+		"key":     req.Key,
+		"value":   req.Value,
+	})
+}
+
+func (p *HTTPPool) handleDelete(c *gin.Context) {
+	groupName, err := url.PathUnescape(c.Param("group"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid group name"})
+		return
+	}
+	key, err := url.PathUnescape(strings.TrimPrefix(c.Param("key"), "/"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid key"})
+		return
+	}
+	if key == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "key is required"})
+		return
+	}
+
+	group := GetGroup(groupName)
+	if group == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no such group: " + groupName})
+		return
+	}
+
+	if err := group.Delete(key); err != nil {
+		if errors.Is(err, ErrKeyNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "ok",
+		"group":   groupName,
+		"key":     key,
+	})
+}
+
 func (p *HTTPPool) Run(addr string) error {
 	return p.engine.Run(addr)
 }
@@ -158,6 +241,65 @@ func (h *httpGetter) Get(in *pb.Request, out *pb.Response) error {
 	return nil
 }
 
+func (h *httpGetter) Set(group string, key string, value []byte) error {
+	body, err := json.Marshal(cacheWriteRequest{
+		Group: group,
+		Key:   key,
+		Value: string(value),
+	})
+	if err != nil {
+		return err
+	}
+
+	targetURL := strings.TrimSuffix(h.baseURL, defaultBasePath) + "/api/cache"
+	req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	res, err := h.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(res.Body)
+		return fmt.Errorf("server returned: %v, body=%s", res.Status, strings.TrimSpace(string(respBody)))
+	}
+	return nil
+}
+
+func (h *httpGetter) Delete(group string, key string) error {
+	targetURL := fmt.Sprintf(
+		"%s/api/cache/%s/%s",
+		strings.TrimSuffix(h.baseURL, defaultBasePath),
+		url.PathEscape(group),
+		url.PathEscape(key),
+	)
+	req, err := http.NewRequest(http.MethodDelete, targetURL, nil)
+	if err != nil {
+		return err
+	}
+
+	res, err := h.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode == http.StatusNotFound {
+		respBody, _ := io.ReadAll(res.Body)
+		return fmt.Errorf("%w: %s", ErrKeyNotFound, strings.TrimSpace(string(respBody)))
+	}
+	if res.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(res.Body)
+		return fmt.Errorf("server returned: %v, body=%s", res.Status, strings.TrimSpace(string(respBody)))
+	}
+	return nil
+}
+
 var _ PeerGetter = (*httpGetter)(nil)
 
 func (p *HTTPPool) Set(peers ...string) {
@@ -183,7 +325,7 @@ func (p *HTTPPool) Set(peers ...string) {
 	}
 }
 
-// PickPeer picks a peer according to key
+// 根据key选择一个peer
 func (p *HTTPPool) PickPeer(key string) (PeerGetter, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -191,14 +333,13 @@ func (p *HTTPPool) PickPeer(key string) (PeerGetter, bool) {
 		return nil, false
 	}
 	// 一致性哈希会根据 key 选择目标节点
+	//只有目标节点不是自己时才会返回true
 	if peer := p.peers.Get(key); peer != "" && peer != p.self {
 		p.Log("Pick peer %s", peer)
 		return p.httpGetters[peer], true
 	}
 	return nil, false
 }
-
-var _ PeerPicker = (*HTTPPool)(nil)
 
 func normalizePeerURL(peer string) string {
 	if strings.HasPrefix(peer, "http://") || strings.HasPrefix(peer, "https://") {

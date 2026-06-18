@@ -66,6 +66,19 @@ func (c *Cache) Add(key string, value Value) {
 	}
 }
 
+// 进一步分隔出remove层
+func (c *Cache) Remove(key string) {
+	if ele, ok := c.cache[key]; ok {
+		c.ll.Remove(ele)
+		kv := ele.Value.(*Entry)
+		delete(c.cache, kv.key)
+		c.nbytes -= int64(len(kv.key)) + int64(kv.value.Len())
+		if c.OnEvicted != nil {
+			c.OnEvicted(kv.key, kv.value)
+		}
+	}
+}
+
 func (c *Cache) Len() int {
 	return c.ll.Len()
 }
